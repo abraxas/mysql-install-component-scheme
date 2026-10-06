@@ -16,6 +16,8 @@
 
 # mysql-install-component-scheme
 
+**Class:** RCE
+
 **MySQL Community Server** `mysqld` `26.7.0` (`06a5c1c`) - Oracle
 
 Default `file://` INSTALL COMPONENT is wrapped by `mysql_server_path_filter` and forced under `plugin_dir`. The unfiltered libminchassis loader stays registered as `dynamic_loader_scheme_file.mysql_minimal_chassis`. URN scheme `file.mysql_minimal_chassis` acquires that implementation and `dlopen`s an absolute path as the mysqld UID. INSTALL PLUGIN / CREATE FUNCTION SONAME still reject `/`. Needs INSERT on `mysql.component` (PR:H).
@@ -25,6 +27,7 @@ Lab copies stock `component_query_attributes.so` to `/tmp/MYSQL-INSTALL-COMPONEN
 | | |
 |---|---|
 | ID | no CVE yet |
+| Class | **RCE** (component `dlopen` as mysqld; PR:H; lab loaded a stock `.so`) |
 | CWE | [CWE-427](https://cwe.mitre.org/data/definitions/427.html) |
 | CVSS | **High: 7.2** `CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqld` |
