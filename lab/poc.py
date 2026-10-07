@@ -228,20 +228,29 @@ _builtins.print = _cprint
 
 import os
 import subprocess
-import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NoReturn
 
 import pymysql
+from pymysql.connections import Connection
+from pymysql.cursors import Cursor
 
-WITNESS = "MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS"
 LABEL = "mysql-install-component-scheme"
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", LABEL)
-HERE = os.path.dirname(os.path.abspath(__file__))
+WITNESS = "MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS"
 IMAGE_TAG = "mysql:26.7.0"
 HOST = "127.0.0.1"
 PORT = 18650
-COPY_STEM = f"/tmp/{WITNESS}"
-COPY_SO = f"{COPY_STEM}.so"
-PREFERRED = (
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "labroot"
+MYSQL_DATABASE = "lab"
+EXPECTED_VERSION = "26.7.0"
+COMPOSE_SERVICE = "mysql"
+COMPONENT_TABLE_SQL = (
+    "SELECT component_id, component_group_id, component_urn FROM mysql.component"
+)
+URN_SCHEME = "file.mysql_minimal_chassis"
+PREFERRED_COMPONENTS: tuple[str, ...] = (
     "component_query_attributes.so",
     "component_audit_api_message_emit.so",
     "component_validate_password.so",
@@ -250,27 +259,70 @@ PREFERRED = (
 )
 
 
+@dataclass(frozen=True)
+class LabConfig:
+    label: str
+    witness: str
+    image: str
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    compose_project: str
+    lab_dir: Path
+    copy_stem: str
+    copy_so: str
+
+    @classmethod
+    def from_env(cls) -> "LabConfig":
+        copy_stem = f"/tmp/{WITNESS}"
+        return cls(
+            label=LABEL,
+            witness=WITNESS,
+            image=IMAGE_TAG,
+            host=HOST,
+            port=PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME", LABEL),
+            lab_dir=Path(__file__).resolve().parent,
+            copy_stem=copy_stem,
+            copy_so=f"{copy_stem}.so",
+        )
+
+
+@dataclass(frozen=True)
+class SqlResult:
+    ok: bool
+    errno: int | None
+    message: str
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fail(reason: str) -> None:
+def fail(reason: str) -> NoReturn:
     log(f"FAIL {LABEL} {reason} {WITNESS}")
     raise SystemExit(1)
 
 
-def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+def compose(
+    cfg: LabConfig, *args: str, timeout: int = 60
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
-        cwd=HERE,
+        ["docker", "compose", "-p", cfg.compose_project, *args],
+        cwd=cfg.lab_dir,
         text=True,
         capture_output=True,
         timeout=timeout,
     )
 
 
-def compose_ok(*args: str, timeout: int = 60) -> str:
-    proc = compose(*args, timeout=timeout)
+def compose_ok(cfg: LabConfig, *args: str, timeout: int = 60) -> str:
+    proc = compose(cfg, *args, timeout=timeout)
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
@@ -281,13 +333,13 @@ def compose_ok(*args: str, timeout: int = 60) -> str:
     return out
 
 
-def connect():
+def connect(cfg: LabConfig) -> Connection:
     return pymysql.connect(
-        host=HOST,
-        port=PORT,
-        user="root",
-        password="labroot",
-        database="lab",
+        host=cfg.host,
+        port=cfg.port,
+        user=cfg.user,
+        password=cfg.password,
+        database=cfg.database,
         autocommit=True,
         charset="utf8mb4",
         connect_timeout=10,
@@ -296,30 +348,53 @@ def connect():
     )
 
 
-def fetch_one(cur, sql: str):
-    cur.execute(sql)
-    row = cur.fetchone()
+def open_root(cfg: LabConfig) -> Connection:
+    try:
+        return connect(cfg)
+    except pymysql.Error as exc:
+        fail(f"root-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
+
+
+def fetch_one(cursor: Cursor, sql: str) -> object | None:
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return None if row is None else row[0]
 
 
-def fetch_all(cur, sql: str):
-    cur.execute(sql)
-    return list(cur.fetchall())
+def fetch_all(cursor: Cursor, sql: str) -> list[tuple[object, ...]]:
+    cursor.execute(sql)
+    return list(cursor.fetchall())
 
 
-def sql_try(cur, sql: str) -> tuple[bool, int | None, str]:
+def sql_try(cursor: Cursor, sql: str) -> SqlResult:
     try:
-        cur.execute(sql)
-        return True, None, "ok"
+        cursor.execute(sql)
+        return SqlResult(True, None, "ok")
     except pymysql.Error as exc:
         errno = exc.args[0] if exc.args else None
         msg = exc.args[1] if len(exc.args) > 1 else str(exc)
-        return False, errno, str(msg)
+        return SqlResult(False, errno, str(msg))
 
 
-def list_plugin_sos(plugin_dir: str) -> list[str]:
-    listing = compose_ok("exec", "-T", "mysql", "ls", "-1", plugin_dir)
-    names = []
+def install_component(cursor: Cursor, urn: str) -> SqlResult:
+    return sql_try(cursor, f"INSTALL COMPONENT '{urn}'")
+
+
+def uninstall_component(cursor: Cursor, urn: str) -> SqlResult:
+    return sql_try(cursor, f"UNINSTALL COMPONENT '{urn}'")
+
+
+def component_rows(cursor: Cursor) -> list[tuple[object, ...]]:
+    return fetch_all(cursor, COMPONENT_TABLE_SQL)
+
+
+def component_urns(rows: list[tuple[object, ...]]) -> list[str]:
+    return [str(row[2]) for row in rows]
+
+
+def list_plugin_sos(cfg: LabConfig, plugin_dir: str) -> list[str]:
+    listing = compose_ok(cfg, "exec", "-T", COMPOSE_SERVICE, "ls", "-1", plugin_dir)
+    names: list[str] = []
     for line in listing.splitlines():
         name = line.strip()
         if name.endswith(".so"):
@@ -328,7 +403,7 @@ def list_plugin_sos(plugin_dir: str) -> list[str]:
 
 
 def already_loaded_names(urns: list[str]) -> set[str]:
-    loaded = set()
+    loaded: set[str] = set()
     for urn in urns:
         text = str(urn)
         base = text.rsplit("/", 1)[-1]
@@ -340,7 +415,7 @@ def already_loaded_names(urns: list[str]) -> set[str]:
 
 
 def pick_source_so(plugin_dir: str, names: list[str], loaded: set[str]) -> str:
-    available = []
+    available: list[str] = []
     for name in names:
         if not name.startswith("component_"):
             continue
@@ -351,150 +426,196 @@ def pick_source_so(plugin_dir: str, names: list[str], loaded: set[str]) -> str:
         available.append(name)
     if not available:
         fail(f"no-unused-component-so plugin_dir={plugin_dir!r} names={names!r}")
-    for pref in PREFERRED:
+    for pref in PREFERRED_COMPONENTS:
         if pref in available:
             return pref
     return available[0]
 
 
-def copy_so(src: str) -> None:
-    compose_ok("exec", "-T", "-u", "0", "mysql", "cp", "-f", src, COPY_SO)
-    compose_ok("exec", "-T", "-u", "0", "mysql", "chmod", "755", COPY_SO)
-    listing = compose_ok("exec", "-T", "mysql", "ls", "-l", COPY_SO)
-    log(f"copied-so src={src!r} dest={COPY_SO!r} ls={listing!r}")
+def copy_so(cfg: LabConfig, src: str) -> None:
+    compose_ok(
+        cfg, "exec", "-T", "-u", "0", COMPOSE_SERVICE, "cp", "-f", src, cfg.copy_so
+    )
+    compose_ok(
+        cfg, "exec", "-T", "-u", "0", COMPOSE_SERVICE, "chmod", "755", cfg.copy_so
+    )
+    listing = compose_ok(cfg, "exec", "-T", COMPOSE_SERVICE, "ls", "-l", cfg.copy_so)
+    log(f"copied-so src={src!r} dest={cfg.copy_so!r} ls={listing!r}")
 
 
-def component_rows(cur) -> list[tuple]:
-    return fetch_all(
-        cur,
-        "SELECT component_id, component_group_id, component_urn FROM mysql.component",
+def read_server_identity(cursor: Cursor) -> tuple[str, str]:
+    version = str(fetch_one(cursor, "SELECT VERSION()") or "")
+    plugin_dir = str(fetch_one(cursor, "SELECT @@plugin_dir") or "").rstrip("/")
+    log(f"mysqld-version={version!r}")
+    log(f"plugin_dir={plugin_dir!r}")
+    if EXPECTED_VERSION not in version:
+        fail(f"version-mismatch version={version!r} image={IMAGE_TAG}")
+    if not plugin_dir:
+        fail("plugin-dir-empty")
+    return version, plugin_dir
+
+
+def stage_unused_component(
+    cfg: LabConfig, plugin_dir: str, loaded_urns: list[str]
+) -> str:
+    names = list_plugin_sos(cfg, plugin_dir)
+    log(f"plugin-dir-sos={names!r}")
+    source_name = pick_source_so(
+        plugin_dir, names, already_loaded_names(loaded_urns)
+    )
+    source_path = f"{plugin_dir}/{source_name}"
+    log(f"source-so={source_path!r}")
+    copy_so(cfg, source_path)
+    return source_path
+
+
+def prove_file_slash_denied(cursor: Cursor, cfg: LabConfig) -> SqlResult:
+    # Default file:// is wrapped by mysql_server_path_filter (errno 3529).
+    filtered_sql = f"INSTALL COMPONENT 'file://{cfg.copy_stem}'"
+    result = sql_try(cursor, filtered_sql)
+    log(
+        f"filtered-file-slash ok={result.ok} errno={result.errno} "
+        f"msg={result.message!r} sql={filtered_sql!r}"
+    )
+    if result.ok:
+        fail("file-slash-allowed expected-denied")
+    return result
+
+
+def prove_install_plugin_denied(cursor: Cursor, cfg: LabConfig) -> SqlResult:
+    # INSTALL PLUGIN / CREATE FUNCTION SONAME still reject a slash (errno 1124).
+    plugin_sql = f"INSTALL PLUGIN lab_scheme SONAME '{cfg.copy_so}'"
+    result = sql_try(cursor, plugin_sql)
+    log(
+        f"install-plugin-path ok={result.ok} errno={result.errno} "
+        f"msg={result.message!r} sql={plugin_sql!r}"
+    )
+    if result.ok:
+        fail("install-plugin-path-allowed expected-denied")
+    return result
+
+
+def load_qualified_urn(cursor: Cursor, cfg: LabConfig) -> tuple[str, SqlResult]:
+    # 3-slash URN: scheme:// + /tmp/WITNESS. Loader appends .so; omit the suffix.
+    urn_primary = f"{URN_SCHEME}://{cfg.copy_stem}"
+    # 4-slash is fallback only.
+    urn_extra = f"{URN_SCHEME}:///{cfg.copy_stem}"
+    result = install_component(cursor, urn_primary)
+    used_urn = urn_primary
+    log(
+        f"qualified-3slash ok={result.ok} errno={result.errno} "
+        f"msg={result.message!r} urn={urn_primary!r}"
+    )
+    if not result.ok:
+        extra = install_component(cursor, urn_extra)
+        log(
+            f"qualified-4slash ok={extra.ok} errno={extra.errno} "
+            f"msg={extra.message!r} urn={urn_extra!r}"
+        )
+        result = extra
+        used_urn = urn_extra
+    if not result.ok:
+        fail(
+            f"qualified-load-denied errno={result.errno} msg={result.message!r} "
+            f"urn={used_urn!r}"
+        )
+    log(f"qualified-load-ok urn={used_urn!r}")
+    return used_urn, result
+
+
+def prove_second_install_rejected(cursor: Cursor, used_urn: str) -> SqlResult:
+    result = install_component(cursor, used_urn)
+    log(
+        f"second-install ok={result.ok} errno={result.errno} msg={result.message!r}"
+    )
+    if result.ok:
+        fail("second-install-allowed expected-already-loaded")
+    return result
+
+
+def prove_uninstall_reinstall(
+    cursor: Cursor, used_urn: str
+) -> list[tuple[object, ...]]:
+    removed = uninstall_component(cursor, used_urn)
+    log(f"uninstall ok={removed.ok} errno={removed.errno} msg={removed.message!r}")
+    if not removed.ok:
+        fail(f"uninstall-failed errno={removed.errno} msg={removed.message!r}")
+    reinstalled = install_component(cursor, used_urn)
+    log(
+        f"reinstall-after-uninstall ok={reinstalled.ok} errno={reinstalled.errno} "
+        f"msg={reinstalled.message!r}"
+    )
+    if not reinstalled.ok:
+        fail(
+            f"reinstall-failed errno={reinstalled.errno} msg={reinstalled.message!r}"
+        )
+    final_rows = component_rows(cursor)
+    log(f"mysql.component-final={final_rows!r}")
+    if used_urn not in component_urns(final_rows):
+        fail(f"component-urn-missing-after-reinstall rows={final_rows!r}")
+    return final_rows
+
+
+def report_success(
+    cfg: LabConfig,
+    plugin_dir: str,
+    source_path: str,
+    filtered: SqlResult,
+    plugin: SqlResult,
+    loaded: SqlResult,
+    used_urn: str,
+    final_rows: list[tuple[object, ...]],
+    version: str,
+) -> None:
+    log(
+        f"IOC plugin_dir={plugin_dir} copied={cfg.copy_so} source={source_path} "
+        f"filtered-errno={filtered.errno} plugin-errno={plugin.errno} "
+        f"qualified-errno={loaded.errno} qualified-urn={used_urn} "
+        f"component-row={final_rows!r} version={version}"
+    )
+    log(
+        f"SUCCESS {cfg.label} file-slash-denied=yes qualified-load=yes "
+        f"component-urn=yes dump=26.7.0 image={cfg.image} {cfg.witness}"
     )
 
 
 def main() -> None:
-    log(f"lab={LABEL} image={IMAGE_TAG} host={HOST} port={PORT}")
-
-    try:
-        conn = connect()
-    except pymysql.Error as exc:
-        fail(f"root-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
-
+    cfg = LabConfig.from_env()
+    log(f"lab={cfg.label} image={cfg.image} host={cfg.host} port={cfg.port}")
+    conn = open_root(cfg)
     with conn:
-        cur = conn.cursor()
-        version = str(fetch_one(cur, "SELECT VERSION()") or "")
-        plugin_dir = str(fetch_one(cur, "SELECT @@plugin_dir") or "").rstrip("/")
-        log(f"mysqld-version={version!r}")
-        log(f"plugin_dir={plugin_dir!r}")
-        if "26.7.0" not in version:
-            fail(f"version-mismatch version={version!r} image={IMAGE_TAG}")
-        if not plugin_dir:
-            fail("plugin-dir-empty")
+        cursor = conn.cursor()
+        version, plugin_dir = read_server_identity(cursor)
 
-        before_rows = component_rows(cur)
-        before_urns = [str(row[2]) for row in before_rows]
+        before_rows = component_rows(cursor)
         log(f"mysql.component-before={before_rows!r}")
-
-        names = list_plugin_sos(plugin_dir)
-        log(f"plugin-dir-sos={names!r}")
-        source_name = pick_source_so(
-            plugin_dir, names, already_loaded_names(before_urns)
+        source_path = stage_unused_component(
+            cfg, plugin_dir, component_urns(before_rows)
         )
-        source_path = f"{plugin_dir}/{source_name}"
-        log(f"source-so={source_path!r}")
-        copy_so(source_path)
 
-        filtered_sql = f"INSTALL COMPONENT 'file://{COPY_STEM}'"
-        filtered_ok, filtered_errno, filtered_msg = sql_try(cur, filtered_sql)
-        log(
-            f"filtered-file-slash ok={filtered_ok} errno={filtered_errno} "
-            f"msg={filtered_msg!r} sql={filtered_sql!r}"
-        )
-        if filtered_ok:
-            fail("file-slash-allowed expected-denied")
+        filtered = prove_file_slash_denied(cursor, cfg)
+        plugin = prove_install_plugin_denied(cursor, cfg)
+        used_urn, loaded = load_qualified_urn(cursor, cfg)
 
-        plugin_sql = f"INSTALL PLUGIN lab_scheme SONAME '{COPY_SO}'"
-        plugin_ok, plugin_errno, plugin_msg = sql_try(cur, plugin_sql)
-        log(
-            f"install-plugin-path ok={plugin_ok} errno={plugin_errno} "
-            f"msg={plugin_msg!r} sql={plugin_sql!r}"
-        )
-        if plugin_ok:
-            fail("install-plugin-path-allowed expected-denied")
-
-        urn_primary = f"file.mysql_minimal_chassis://{COPY_STEM}"
-        urn_extra = f"file.mysql_minimal_chassis:///{COPY_STEM}"
-        load_ok, load_errno, load_msg = sql_try(
-            cur, f"INSTALL COMPONENT '{urn_primary}'"
-        )
-        used_urn = urn_primary
-        log(
-            f"qualified-3slash ok={load_ok} errno={load_errno} "
-            f"msg={load_msg!r} urn={urn_primary!r}"
-        )
-        if not load_ok:
-            extra_ok, extra_errno, extra_msg = sql_try(
-                cur, f"INSTALL COMPONENT '{urn_extra}'"
-            )
-            log(
-                f"qualified-4slash ok={extra_ok} errno={extra_errno} "
-                f"msg={extra_msg!r} urn={urn_extra!r}"
-            )
-            load_ok, load_errno, load_msg = extra_ok, extra_errno, extra_msg
-            used_urn = urn_extra
-        if not load_ok:
-            fail(
-                f"qualified-load-denied errno={load_errno} msg={load_msg!r} "
-                f"urn={used_urn!r}"
-            )
-        log(f"qualified-load-ok urn={used_urn!r}")
-
-        after_rows = component_rows(cur)
-        after_urns = [str(row[2]) for row in after_rows]
+        after_rows = component_rows(cursor)
         log(f"mysql.component-after={after_rows!r}")
-        if used_urn not in after_urns:
+        if used_urn not in component_urns(after_rows):
             fail(f"component-urn-missing rows={after_rows!r} expected={used_urn!r}")
 
-        again_ok, again_errno, again_msg = sql_try(
-            cur, f"INSTALL COMPONENT '{used_urn}'"
+        prove_second_install_rejected(cursor, used_urn)
+        final_rows = prove_uninstall_reinstall(cursor, used_urn)
+        report_success(
+            cfg,
+            plugin_dir,
+            source_path,
+            filtered,
+            plugin,
+            loaded,
+            used_urn,
+            final_rows,
+            version,
         )
-        log(
-            f"second-install ok={again_ok} errno={again_errno} msg={again_msg!r}"
-        )
-        if again_ok:
-            fail("second-install-allowed expected-already-loaded")
-
-        un_ok, un_errno, un_msg = sql_try(cur, f"UNINSTALL COMPONENT '{used_urn}'")
-        log(f"uninstall ok={un_ok} errno={un_errno} msg={un_msg!r}")
-        if not un_ok:
-            fail(f"uninstall-failed errno={un_errno} msg={un_msg!r}")
-        reinstall_ok, reinstall_errno, reinstall_msg = sql_try(
-            cur, f"INSTALL COMPONENT '{used_urn}'"
-        )
-        log(
-            f"reinstall-after-uninstall ok={reinstall_ok} errno={reinstall_errno} "
-            f"msg={reinstall_msg!r}"
-        )
-        if not reinstall_ok:
-            fail(
-                f"reinstall-failed errno={reinstall_errno} msg={reinstall_msg!r}"
-            )
-        final_rows = component_rows(cur)
-        final_urns = [str(row[2]) for row in final_rows]
-        log(f"mysql.component-final={final_rows!r}")
-        if used_urn not in final_urns:
-            fail(f"component-urn-missing-after-reinstall rows={final_rows!r}")
-
-        log(
-            f"IOC plugin_dir={plugin_dir} copied={COPY_SO} source={source_path} "
-            f"filtered-errno={filtered_errno} plugin-errno={plugin_errno} "
-            f"qualified-errno={load_errno} qualified-urn={used_urn} "
-            f"component-row={final_rows!r} version={version}"
-        )
-        log(
-            f"SUCCESS {LABEL} file-slash-denied=yes qualified-load=yes "
-            f"component-urn=yes dump=26.7.0 image={IMAGE_TAG} {WITNESS}"
-        )
-        cur.close()
+        cursor.close()
 
 
 if __name__ == "__main__":
@@ -504,5 +625,4 @@ if __name__ == "__main__":
         raise
     except Exception as exc:
         fail(f"exception={type(exc).__name__}:{exc}")
-        sys.exit(1)
 

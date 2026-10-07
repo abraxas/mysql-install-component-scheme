@@ -25,7 +25,7 @@ Default `file://` INSTALL COMPONENT is wrapped by `mysql_server_path_filter` and
 
 Lab copies stock `component_query_attributes.so` to `/tmp/MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS.so`. No custom component.
 
-| | |
+| Field | Value |
 |---|---|
 | ID | no CVE yet |
 | Class | **RCE** (component `dlopen` as mysqld; PR:H; lab loaded a stock `.so`) |
@@ -65,7 +65,7 @@ cd lab
 ./run.sh
 ```
 
-Image `mysql:26.7.0`. Published `127.0.0.1:18650`. `plugin_dir=/usr/lib64/mysql/plugin`. Copy stock `component_query_attributes.so` to `/tmp/MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS.so`.
+Image `mysql:26.7.0`. Published `127.0.0.1:18650`. `plugin_dir=/usr/lib64/mysql/plugin`. Copies stock `component_query_attributes.so` to `/tmp/MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS.so`.
 
 ```text
 SUCCESS mysql-install-component-scheme file-slash-denied=yes qualified-load=yes component-urn=yes dump=26.7.0 image=mysql:26.7.0 MYSQL-INSTALL-COMPONENT-SCHEME-WITNESS
