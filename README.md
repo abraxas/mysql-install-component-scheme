@@ -17,6 +17,7 @@
 # mysql-install-component-scheme
 
 **Class:** RCE
+**Reach:** Remote
 
 **MySQL Community Server** `mysqld` `26.7.0` (`06a5c1c`) - Oracle
 
@@ -28,6 +29,7 @@ Lab copies stock `component_query_attributes.so` to `/tmp/MYSQL-INSTALL-COMPONEN
 |---|---|
 | ID | no CVE yet |
 | Class | **RCE** (component `dlopen` as mysqld; PR:H; lab loaded a stock `.so`) |
+| Reach | **Remote** (authenticated SQL; INSTALL COMPONENT / PR:H) |
 | CWE | [CWE-427](https://cwe.mitre.org/data/definitions/427.html) |
 | CVSS | **High: 7.2** `CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqld` |
