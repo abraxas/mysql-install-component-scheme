@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/mysql-install-component-scheme">mysql-install-component-scheme</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/mysql-install-component-scheme"><strong>https://abraxaslabs.tech/research/mysql-install-component-scheme</strong></a>
+</p>
+
 
 # mysql-install-component-scheme
 
